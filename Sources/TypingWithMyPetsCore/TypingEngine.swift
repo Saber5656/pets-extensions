@@ -178,6 +178,18 @@ public func formatDuration(_ duration: TimeInterval) -> String {
     return String(format: "%02d:%02d", seconds / 60, seconds % 60)
 }
 
+public func typingScore(for metrics: TypingMetrics) -> Int {
+    let progressScore = metrics.progress * 500.0
+    let speedScore = min(metrics.wpm, 120.0) * 5.0
+    let accuracyWeight = metrics.typedCharacters > 0 ? metrics.progress : 0.0
+    let accuracyScore = metrics.accuracy * 4.0 * accuracyWeight
+    let completionBonus = metrics.completed ? 250.0 : 0.0
+    let errorPenalty = Double(max(metrics.totalErrors, metrics.liveErrors)) * 35.0
+    let rawScore = progressScore + speedScore + accuracyScore + completionBonus - errorPenalty
+
+    return max(0, Int(rawScore.rounded()))
+}
+
 public extension Exercise {
     static let defaults: [Exercise] = [
         Exercise(

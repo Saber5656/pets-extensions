@@ -120,15 +120,6 @@ private final class CodexPetWindowTracker {
         return selected
     }
 
-    func fallbackFrame() -> CGRect {
-        if let lastFrame {
-            return lastFrame
-        }
-
-        let screen = NSScreen.main?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
-        return CGRect(x: screen.midX - 72, y: screen.midY - 78, width: 144, height: 156)
-    }
-
     private static func convertCGWindowFrame(_ cgFrame: CGRect) -> CGRect {
         let mainDisplayHeight = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
             ?? NSScreen.main?.frame.height
@@ -546,10 +537,9 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
     private var exerciseIndex = 0
     private var session: TypingSession
     private var chatVisibility: ChatVisibility = .open
-    private var lastDetectedPetFrame: CGRect?
-    private var lastDetectedPetVisualFrame: CGRect?
     private var lastPetToggleAt: TimeInterval = 0
     private var submittedAt: TimeInterval?
+    private var petIsAvailable = false
 
     override init() {
         inputPanel = InputPanelView(
@@ -596,6 +586,7 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
         window.makeFirstResponder(inputPanel.textView)
         startTimer()
         startPetClickMonitor()
+        updateOverlayPosition()
     }
 
     private func startTimer() {
@@ -662,6 +653,9 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
         if visible {
             (window as? OverlayWindow)?.acceptsKeyboardFocus = true
             updateOverlayPosition()
+            guard petIsAvailable else {
+                return
+            }
             window?.orderFrontRegardless()
             window?.makeKey()
             window?.makeFirstResponder(inputPanel.textView)
@@ -672,30 +666,19 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
             (window as? OverlayWindow)?.acceptsKeyboardFocus = false
             window?.resignKey()
             updateOverlayPosition()
-            window?.orderFrontRegardless()
         }
     }
 
     private func toggleChatIfPetWasSecondaryClicked(at location: CGPoint) {
-        let currentPetWindow = tracker.currentPetWindow()
-        let petVisualFrame: CGRect
-        if let currentPetWindow {
-            let screen = bestScreen(for: currentPetWindow.frame.center)
-            let visualFrame = petRegion.visibleFrame(for: currentPetWindow, on: screen)
-            lastDetectedPetFrame = currentPetWindow.frame
-            lastDetectedPetVisualFrame = visualFrame
-
-            guard petRegion.containsPetBody(location, in: visualFrame) else {
-                return
-            }
-            petVisualFrame = visualFrame
-        } else if let lastDetectedPetVisualFrame {
-            petVisualFrame = lastDetectedPetVisualFrame
-        } else if let lastDetectedPetFrame {
-            petVisualFrame = lastDetectedPetFrame
-        } else {
+        guard let currentPetWindow = tracker.currentPetWindow() else {
+            petIsAvailable = false
+            window?.orderOut(nil)
             return
         }
+
+        let screen = bestScreen(for: currentPetWindow.frame.center)
+        let petVisualFrame = petRegion.visibleFrame(for: currentPetWindow, on: screen)
+        petIsAvailable = true
 
         guard petRegion.containsPetBody(location, in: petVisualFrame) else { return }
 
@@ -757,7 +740,7 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
     }
 
     private func updateStats() {
-        let metrics = session.metrics(at: submittedAt ?? session.completedAt ?? Date().timeIntervalSince1970)
+        let metrics = session.metrics(at: session.completedAt ?? submittedAt ?? Date().timeIntervalSince1970)
         let score = typingScore(for: metrics)
         let progress = Int((metrics.progress * 100).rounded())
         let wpm = Int(metrics.wpm.rounded())
@@ -791,17 +774,22 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
     private func updateOverlayPosition() {
         guard let window else { return }
 
-        let petWindow = tracker.currentPetWindow()
-        if let petWindow {
-            let screen = bestScreen(for: petWindow.frame.center)
-            lastDetectedPetFrame = petWindow.frame
-            lastDetectedPetVisualFrame = petRegion.visibleFrame(for: petWindow, on: screen)
+        guard let petWindow = tracker.currentPetWindow() else {
+            petIsAvailable = false
+            window.makeFirstResponder(nil)
+            (window as? OverlayWindow)?.acceptsKeyboardFocus = false
+            window.ignoresMouseEvents = true
+            window.orderOut(nil)
+            return
         }
-        let petFrame = lastDetectedPetVisualFrame ?? lastDetectedPetFrame ?? tracker.fallbackFrame()
+
+        let detectedScreen = bestScreen(for: petWindow.frame.center)
+        let petFrame = petRegion.visibleFrame(for: petWindow, on: detectedScreen)
+        petIsAvailable = true
         let screen = bestScreen(for: petFrame.center)
         if chatVisibility == .closed {
-            let desired = CGRect(x: petFrame.midX, y: petFrame.midY, width: 1, height: 1)
-            window.setFrame(clamped(desired, in: screen.visibleFrame), display: true)
+            window.ignoresMouseEvents = true
+            window.orderOut(nil)
             return
         }
 
@@ -825,6 +813,14 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
             height: size.height
         )
         window.setFrame(clamped(desired, in: screen.visibleFrame), display: true)
+        window.ignoresMouseEvents = false
+        (window as? OverlayWindow)?.acceptsKeyboardFocus = true
+
+        if !window.isVisible {
+            window.orderFrontRegardless()
+            window.makeKey()
+            window.makeFirstResponder(inputPanel.textView)
+        }
     }
 }
 
@@ -859,8 +855,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         self.controller = controller
         self.window = window
 
-        window.orderFrontRegardless()
-        window.makeKey()
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -883,16 +877,6 @@ private func clamped(_ frame: CGRect, in bounds: CGRect) -> CGRect {
         width: frame.width,
         height: frame.height
     )
-}
-
-private func typingScore(for metrics: TypingMetrics) -> Int {
-    let progressScore = metrics.progress * 500.0
-    let speedScore = min(metrics.wpm, 120.0) * 5.0
-    let accuracyScore = metrics.accuracy * 4.0
-    let completionBonus = metrics.completed ? 250.0 : 0.0
-    let errorPenalty = Double(max(metrics.totalErrors, metrics.liveErrors)) * 35
-    let rawScore = progressScore + speedScore + accuracyScore + completionBonus - errorPenalty
-    return max(0, Int(rawScore.rounded()))
 }
 
 private func distance(_ lhs: CGPoint, _ rhs: CGPoint) -> CGFloat {
