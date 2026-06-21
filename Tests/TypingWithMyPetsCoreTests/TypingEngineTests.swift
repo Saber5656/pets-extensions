@@ -71,10 +71,38 @@ final class TypingEngineTests: XCTestCase {
         XCTAssertEqual(session.metrics(at: 12).accuracy, 100)
     }
 
+    func testBlankSubmissionDoesNotReceiveAccuracyScore() {
+        let session = TypingSession(exercise: exercise, now: 0)
+        let metrics = session.metrics(at: 10)
+
+        XCTAssertEqual(typingScore(for: metrics), 0)
+    }
+
+    func testAccuracyScoreScalesWithProgress() {
+        var partialSession = TypingSession(exercise: exercise, now: 0)
+        var completeSession = TypingSession(exercise: exercise, now: 0)
+
+        _ = partialSession.update(rawInput: "a", now: 10)
+        _ = completeSession.update(rawInput: "abcd", now: 10)
+
+        let partialScore = typingScore(for: partialSession.metrics(at: 10))
+        let completeScore = typingScore(for: completeSession.metrics(at: 10))
+
+        XCTAssertGreaterThan(partialScore, 0)
+        XCTAssertLessThan(partialScore, completeScore)
+    }
+
     func testFeedbackStates() {
         let states = feedback(for: "abcd", input: "ax").map(\.state)
 
         XCTAssertEqual(states, [.correct, .incorrect, .current, .pending])
+    }
+
+    func testDefaultExercisesProvideVariety() {
+        let ids = Exercise.defaults.map(\.id)
+
+        XCTAssertGreaterThanOrEqual(Exercise.defaults.count, 20)
+        XCTAssertEqual(Set(ids).count, ids.count)
     }
 
 }

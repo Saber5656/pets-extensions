@@ -45,10 +45,12 @@ Test core logic:
 
 | Control | Action |
 |---|---|
-| Tap the Codex Pet | Toggle the typing panel open/closed |
+| Two-finger tap / secondary click on the Codex Pet | Toggle the typing panel open/closed |
 | `×` | Close only the typing panel |
 | `Esc` | Close only the typing panel |
 | `⌘Q` | Quit the overlay app |
+| `Return` | Submit the current attempt and show the result score |
+| `Return` after submitting | Move to the next prompt |
 | `↻` | Restart current prompt |
 | `→` | Next prompt |
 
@@ -57,5 +59,5 @@ Test core logic:
 - The typing panel window is transparent and borderless.
 - If the Codex Pet window is not detectable, the panel stays near the last known Pet position or the display center.
 - The implementation uses macOS CoreGraphics on-screen window metadata. It does not inject UI into Codex and does not modify Codex Pet assets.
-- Pet tap toggling while open is implemented by observing global left-click events and checking whether the click landed inside the tracked Pet window bounds.
-- When the panel is closed, the app keeps an invisible click hotspot aligned over the tracked Pet so tapping the Pet can reopen the panel reliably.
+- Pet toggling is implemented by observing global secondary-click events and checking whether the click landed inside a tightened Pet body region.
+- When the panel is closed, the app ignores mouse events and relies on the secondary-click monitor, so the invisible overlay no longer steals ordinary Pet clicks.

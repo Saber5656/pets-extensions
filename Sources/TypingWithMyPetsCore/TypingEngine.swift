@@ -178,6 +178,18 @@ public func formatDuration(_ duration: TimeInterval) -> String {
     return String(format: "%02d:%02d", seconds / 60, seconds % 60)
 }
 
+public func typingScore(for metrics: TypingMetrics) -> Int {
+    let progressScore = metrics.progress * 500.0
+    let speedScore = min(metrics.wpm, 120.0) * 5.0
+    let accuracyWeight = metrics.typedCharacters > 0 ? metrics.progress : 0.0
+    let accuracyScore = metrics.accuracy * 4.0 * accuracyWeight
+    let completionBonus = metrics.completed ? 250.0 : 0.0
+    let errorPenalty = Double(max(metrics.totalErrors, metrics.liveErrors)) * 35.0
+    let rawScore = progressScore + speedScore + accuracyScore + completionBonus - errorPenalty
+
+    return max(0, Int(rawScore.rounded()))
+}
+
 public extension Exercise {
     static let defaults: [Exercise] = [
         Exercise(
@@ -199,6 +211,106 @@ public extension Exercise {
             id: "swift-snippet",
             title: "Swift",
             text: "let score = max(0, typed - errors)"
+        ),
+        Exercise(
+            id: "calm-debug",
+            title: "Debug",
+            text: "Pause, read the log, then change one thing."
+        ),
+        Exercise(
+            id: "clear-commit",
+            title: "Commit",
+            text: "Small commits make future reviews easier."
+        ),
+        Exercise(
+            id: "focus-window",
+            title: "Focus",
+            text: "Keep the window small and the goal clear."
+        ),
+        Exercise(
+            id: "steady-breath",
+            title: "Steady",
+            text: "A steady breath makes careful typing easier."
+        ),
+        Exercise(
+            id: "ship-safely",
+            title: "Ship",
+            text: "Ship the fix after the check turns green."
+        ),
+        Exercise(
+            id: "tiny-loop",
+            title: "Loop",
+            text: "Try, observe, adjust, and try again."
+        ),
+        Exercise(
+            id: "bright-terminal",
+            title: "Terminal",
+            text: "The terminal tells a story if you read it."
+        ),
+        Exercise(
+            id: "kind-review",
+            title: "Review",
+            text: "A kind review still names the real risk."
+        ),
+        Exercise(
+            id: "local-first",
+            title: "Local",
+            text: "Prefer local checks before remote surprises."
+        ),
+        Exercise(
+            id: "sharp-diff",
+            title: "Diff",
+            text: "A sharp diff explains the shape of the work."
+        ),
+        Exercise(
+            id: "gentle-speed",
+            title: "Speed",
+            text: "Speed grows from rhythm, not from panic."
+        ),
+        Exercise(
+            id: "error-signal",
+            title: "Signal",
+            text: "Every error is a signal with a location."
+        ),
+        Exercise(
+            id: "quiet-state",
+            title: "State",
+            text: "Name the state before changing the view."
+        ),
+        Exercise(
+            id: "short-path",
+            title: "Path",
+            text: "Take the short path only after you see it."
+        ),
+        Exercise(
+            id: "clean-prompt",
+            title: "Prompt",
+            text: "Clean prompts make clean answers more likely."
+        ),
+        Exercise(
+            id: "mouse-free",
+            title: "Keys",
+            text: "Hands on keys, eyes on the next character."
+        ),
+        Exercise(
+            id: "日本語-観察",
+            title: "観察",
+            text: "まず観察してから、短い変更を入れる。"
+        ),
+        Exercise(
+            id: "日本語-集中",
+            title: "集中",
+            text: "一文ずつ、焦らず、正確に打つ。"
+        ),
+        Exercise(
+            id: "日本語-確認",
+            title: "確認",
+            text: "動いた理由と、残る不安を分けて書く。"
+        ),
+        Exercise(
+            id: "日本語-余白",
+            title: "余白",
+            text: "少し余白があると、判断も読みやすい。"
         )
     ]
 }
