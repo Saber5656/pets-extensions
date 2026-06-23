@@ -41,6 +41,14 @@ Test core logic:
 
 `Package.swift` is included for normal SwiftPM-compatible environments, but the scripts above intentionally use `swiftc` directly so the app can still build if the local SwiftPM manifest runner is unhealthy.
 
+## Releases
+
+See [RELEASE_NOTES.md](RELEASE_NOTES.md) before cutting or downloading a release.
+
+The current `v0.1.0` release plan is a developer preview. The app bundle is
+unsigned and not notarized, so macOS may show a Gatekeeper warning on first
+launch.
+
 ## Controls
 
 | Control | Action |
@@ -57,7 +65,7 @@ Test core logic:
 ## Notes
 
 - The typing panel window is transparent and borderless.
-- If the Codex Pet window is not detectable, the panel stays near the last known Pet position or the display center.
+- If the Codex Pet window is not detectable, the panel stays hidden.
 - The implementation uses macOS CoreGraphics on-screen window metadata. It does not inject UI into Codex and does not modify Codex Pet assets.
 - Pet toggling is implemented by observing global secondary-click events and checking whether the click landed inside a tightened Pet body region.
 - When the panel is closed, the app ignores mouse events and relies on the secondary-click monitor, so the invisible overlay no longer steals ordinary Pet clicks.
