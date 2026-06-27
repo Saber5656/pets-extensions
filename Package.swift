@@ -15,7 +15,10 @@ let package = Package(
         .target(name: "TypingWithMyPetsCore"),
         .executableTarget(
             name: "TypingWithMyPets",
-            dependencies: ["TypingWithMyPetsCore"]
+            dependencies: ["TypingWithMyPetsCore"],
+            linkerSettings: [
+                .linkedFramework("EventKit")
+            ]
         ),
         .testTarget(
             name: "TypingWithMyPetsCoreTests",

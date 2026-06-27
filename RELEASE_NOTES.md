@@ -1,5 +1,16 @@
 # Release Notes
 
+## Unreleased
+
+- Adds a conversation mode toggle next to typing practice mode.
+- Uses Apple FoundationModels for local conversation on supported macOS versions, with no cloud or rule-based fallback chat.
+- Adds EventKit Reminders support for explicit one-time reminder requests with a clear future date and time.
+- Adds one-step undo for the last reminder created during the app session.
+- Adds one-turn reminder clarification merging for follow-up answers like `午後`.
+- Adds confirmation-gated Codex App Server handoff for coding, research, repository, app opening, and Computer Use style requests through the local Codex CLI.
+- Adds Codex handoff workdir override via `TWMP_CODEX_WORKDIR`.
+- Keeps app launching and macOS operation out of the pet's direct responsibility; Codex owns delegated app/GUI work.
+
 ## v0.1.0
 
 Initial developer preview of Typing With My Pets.

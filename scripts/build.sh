@@ -6,14 +6,25 @@ BUILD_DIR="$ROOT_DIR/.build/manual"
 COMBINED_MAIN="$BUILD_DIR/main.swift"
 BINARY="$BUILD_DIR/TypingWithMyPets"
 APP_DIR="$BUILD_DIR/TypingWithMyPets.app"
+MODULE_CACHE_DIR="$BUILD_DIR/module-cache"
+SDK_PATH="$(xcrun --show-sdk-path --sdk macosx)"
+TARGET_TRIPLE="${TWMP_SWIFT_TARGET:-$(uname -m)-apple-macosx13.0}"
 
-mkdir -p "$BUILD_DIR"
+mkdir -p "$BUILD_DIR" "$MODULE_CACHE_DIR"
 grep -v '^import TypingWithMyPetsCore$' "$ROOT_DIR/Sources/TypingWithMyPets/main.swift" > "$COMBINED_MAIN"
 
+frameworks=(-framework AppKit -framework EventKit)
+if [ -d "$SDK_PATH/System/Library/Frameworks/FoundationModels.framework" ]; then
+  frameworks+=(-framework FoundationModels)
+fi
+
 swiftc \
+  -target "$TARGET_TRIPLE" \
+  -module-cache-path "$MODULE_CACHE_DIR" \
+  "$ROOT_DIR/Sources/TypingWithMyPetsCore/ConversationEngine.swift" \
   "$ROOT_DIR/Sources/TypingWithMyPetsCore/TypingEngine.swift" \
   "$COMBINED_MAIN" \
-  -framework AppKit \
+  "${frameworks[@]}" \
   -o "$BINARY"
 
 rm -rf "$APP_DIR"
@@ -40,6 +51,12 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <true/>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSSupportsAutomaticTermination</key>
+  <false/>
+  <key>NSSupportsSuddenTermination</key>
+  <false/>
+  <key>NSRemindersUsageDescription</key>
+  <string>Typing With My Pets uses Reminders only when you explicitly ask the pet to create a reminder.</string>
 </dict>
 </plist>
 PLIST

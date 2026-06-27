@@ -1,11 +1,21 @@
 import AppKit
 import CoreGraphics
+import EventKit
 import Foundation
 import TypingWithMyPetsCore
+
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
 
 private enum InputPlacement {
     case leftOfPet
     case rightOfPet
+}
+
+private enum InteractionMode {
+    case typing
+    case conversation
 }
 
 private enum ChatVisibility {
@@ -218,8 +228,14 @@ private final class OverlayWindow: NSWindow {
 }
 
 private final class TransparentTypingTextView: NSTextView {
+    enum ReturnKeyBehavior {
+        case submit
+        case submitWithShiftNewline
+    }
+
     var onEscape: (() -> Void)?
     var onSubmit: (() -> Void)?
+    var returnKeyBehavior: ReturnKeyBehavior = .submit
 
     override func keyDown(with event: NSEvent) {
         if event.modifierFlags.contains(.command),
@@ -236,6 +252,9 @@ private final class TransparentTypingTextView: NSTextView {
         if event.keyCode == 36 || event.keyCode == 76 {
             if hasMarkedText() {
                 super.keyDown(with: event)
+            } else if returnKeyBehavior == .submitWithShiftNewline,
+                      event.modifierFlags.contains(.shift) {
+                super.keyDown(with: event)
             } else {
                 onSubmit?()
             }
@@ -246,16 +265,354 @@ private final class TransparentTypingTextView: NSTextView {
     }
 }
 
+private protocol ConversationProviding: AnyObject, Sendable {
+    var unavailableReason: String? { get }
+    func response(to userMessage: String, session: ConversationSession) async throws -> String
+}
+
+private final class UnavailableConversationProvider: ConversationProviding, @unchecked Sendable {
+    let unavailableReason: String?
+
+    init(reason: String) {
+        self.unavailableReason = reason
+    }
+
+    func response(to userMessage: String, session: ConversationSession) async throws -> String {
+        unavailableReason ?? "会話モードはこのMacではまだ使えません。"
+    }
+}
+
+private protocol ReminderManaging: AnyObject, Sendable {
+    func createReminder(_ request: ReminderRequest) async throws -> String
+    func removeReminder(identifier: String) async throws
+}
+
+private enum ReminderManagerError: Error {
+    case accessDenied
+    case noDefaultCalendar
+    case reminderNotFound
+}
+
+private final class EventKitReminderManager: ReminderManaging, @unchecked Sendable {
+    private let eventStore = EKEventStore()
+
+    func createReminder(_ request: ReminderRequest) async throws -> String {
+        try Task.checkCancellation()
+        try await ensureReminderAccess()
+        try Task.checkCancellation()
+        guard let calendar = eventStore.defaultCalendarForNewReminders() else {
+            throw ReminderManagerError.noDefaultCalendar
+        }
+
+        let reminder = EKReminder(eventStore: eventStore)
+        reminder.title = request.title
+        reminder.calendar = calendar
+        reminder.dueDateComponents = Calendar.current.dateComponents(
+            [.year, .month, .day, .hour, .minute],
+            from: request.dueDate
+        )
+        reminder.addAlarm(EKAlarm(absoluteDate: request.dueDate))
+        try Task.checkCancellation()
+        try eventStore.save(reminder, commit: true)
+        return reminder.calendarItemIdentifier
+    }
+
+    func removeReminder(identifier: String) async throws {
+        try Task.checkCancellation()
+        try await ensureReminderAccess()
+        try Task.checkCancellation()
+        guard let reminder = eventStore.calendarItem(withIdentifier: identifier) as? EKReminder else {
+            throw ReminderManagerError.reminderNotFound
+        }
+        try Task.checkCancellation()
+        try eventStore.remove(reminder, commit: true)
+    }
+
+    private func ensureReminderAccess() async throws {
+        let granted: Bool
+        if #available(macOS 14.0, *) {
+            granted = try await requestFullReminderAccess()
+        } else {
+            granted = try await requestLegacyReminderAccess()
+        }
+
+        if !granted {
+            throw ReminderManagerError.accessDenied
+        }
+    }
+
+    @available(macOS 14.0, *)
+    private func requestFullReminderAccess() async throws -> Bool {
+        try await withCheckedThrowingContinuation { continuation in
+            eventStore.requestFullAccessToReminders { granted, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: granted)
+                }
+            }
+        }
+    }
+
+    @available(macOS, introduced: 10.8, deprecated: 14.0)
+    private func requestLegacyReminderAccess() async throws -> Bool {
+        let granted: Bool = try await withCheckedThrowingContinuation { continuation in
+            eventStore.requestAccess(to: .reminder) { granted, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: granted)
+                }
+            }
+        }
+        return granted
+    }
+}
+
+private protocol CodexHandoffExecuting: AnyObject, Sendable {
+    var unavailableReason: String? { get }
+    func execute(_ request: CodexHandoffRequest) async throws -> String
+}
+
+private enum CodexHandoffExecutorError: Error {
+    case codexUnavailable
+    case processFailed(Int32)
+}
+
+private final class RunningProcessBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    func set(_ process: Process) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !cancelled else {
+            process.terminate()
+            return false
+        }
+
+        self.process = process
+        return true
+    }
+
+    func terminate() {
+        lock.lock()
+        cancelled = true
+        let process = process
+        lock.unlock()
+
+        process?.terminate()
+    }
+
+    func clear() {
+        lock.lock()
+        process = nil
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+}
+
+private final class CodexAppServerHandoffExecutor: CodexHandoffExecuting, @unchecked Sendable {
+    var unavailableReason: String? {
+        resolvedCodexURL() == nil ? "Codex CLIが見つからないよ。" : nil
+    }
+
+    func execute(_ request: CodexHandoffRequest) async throws -> String {
+        guard let codexURL = resolvedCodexURL() else {
+            throw CodexHandoffExecutorError.codexUnavailable
+        }
+
+        let processBox = RunningProcessBox()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        let process = Process()
+                        let workDirectoryURL = self.resolvedWorkDirectoryURL()
+                        let taskText = """
+                        \(request.taskText)
+
+                        起動時作業ディレクトリ:
+                        \(workDirectoryURL.path)
+                        """
+                        process.executableURL = codexURL
+                        process.arguments = [
+                            "debug",
+                            "app-server",
+                            "send-message-v2",
+                            taskText
+                        ]
+                        process.currentDirectoryURL = workDirectoryURL
+
+                        let logURL = FileManager.default.temporaryDirectory
+                            .appendingPathComponent("typing-with-my-pets-codex-handoff-\(UUID().uuidString).log")
+                        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+                        let logHandle = try FileHandle(forWritingTo: logURL)
+                        defer {
+                            try? logHandle.close()
+                            processBox.clear()
+                        }
+
+                        process.standardOutput = logHandle
+                        process.standardError = logHandle
+
+                        guard processBox.set(process) else {
+                            throw CancellationError()
+                        }
+
+                        try process.run()
+                        process.waitUntilExit()
+
+                        if processBox.isCancelled {
+                            throw CancellationError()
+                        }
+                        guard process.terminationStatus == 0 else {
+                            throw CodexHandoffExecutorError.processFailed(process.terminationStatus)
+                        }
+
+                        continuation.resume(returning: "Codexに引き継いだよ。進行はCodex側で確認してね。")
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        } onCancel: {
+            processBox.terminate()
+        }
+    }
+
+    private func resolvedCodexURL() -> URL? {
+        let environmentPath = ProcessInfo.processInfo.environment["TWMP_CODEX_CLI_PATH"]
+        let candidatePaths = [
+            environmentPath,
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".codex/plugins/.plugin-appserver/codex")
+                .path,
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex"
+        ].compactMap { $0 }
+
+        return candidatePaths
+            .map(URL.init(fileURLWithPath:))
+            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    private func resolvedWorkDirectoryURL() -> URL {
+        if let environmentPath = ProcessInfo.processInfo.environment["TWMP_CODEX_WORKDIR"],
+           isDirectory(atPath: environmentPath) {
+            return URL(fileURLWithPath: environmentPath)
+        }
+
+        let currentPath = FileManager.default.currentDirectoryPath
+        if isDirectory(atPath: currentPath) {
+            return URL(fileURLWithPath: currentPath)
+        }
+
+        return FileManager.default.homeDirectoryForCurrentUser
+    }
+
+    private func isDirectory(atPath path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+    }
+}
+
+#if canImport(FoundationModels)
+@available(macOS 26.0, *)
+private final class FoundationModelsConversationProvider: ConversationProviding, @unchecked Sendable {
+    private let model = SystemLanguageModel.default
+
+    var unavailableReason: String? {
+        switch model.availability {
+        case .available:
+            return nil
+        case .unavailable(let reason):
+            switch reason {
+            case .deviceNotEligible:
+                return "このMacでは会話モードを使えません。"
+            case .appleIntelligenceNotEnabled:
+                return "Apple Intelligenceを有効にすると会話できるよ。"
+            case .modelNotReady:
+                return "会話モデルの準備中です。少し待ってね。"
+            @unknown default:
+                return "会話モードは今は使えません。"
+            }
+        }
+    }
+
+    func response(to userMessage: String, session: ConversationSession) async throws -> String {
+        if let unavailableReason {
+            return unavailableReason
+        }
+
+        let languageSession = LanguageModelSession(
+            model: model,
+            tools: [],
+            instructions: session.persona.systemInstructions
+        )
+        let response = try await languageSession.respond(
+            to: prompt(for: userMessage, session: session)
+        )
+
+        return ConversationResponseNormalizer.normalize(
+            response.content,
+            maxSentences: session.persona.maxResponseSentences
+        )
+    }
+
+    private func prompt(for userMessage: String, session: ConversationSession) -> String {
+        var lines = [
+            "Recent conversation, oldest to newest:",
+        ]
+        if session.recentMessages.isEmpty {
+            lines.append("(none)")
+        } else {
+            for message in session.recentMessages {
+                let speaker = message.speaker == .user ? "User" : "Pet"
+                lines.append("\(speaker): \(message.text)")
+            }
+        }
+        lines.append("User: \(userMessage)")
+        lines.append("Reply as the Pet.")
+        return lines.joined(separator: "\n")
+    }
+}
+#endif
+
+private func makeConversationProvider() -> ConversationProviding {
+    #if canImport(FoundationModels)
+    if #available(macOS 26.0, *) {
+        return FoundationModelsConversationProvider()
+    }
+    #endif
+    return UnavailableConversationProvider(reason: "会話モードはmacOS 26以降で使えます。")
+}
+
 private final class InputPanelView: NSView {
     let targetLabel = NSTextField(labelWithString: "")
     let statsLabel = NSTextField(labelWithString: "")
     let textView = TransparentTypingTextView()
     let restartButton = NSButton(title: "↻", target: nil, action: nil)
     let nextButton = NSButton(title: "→", target: nil, action: nil)
+    let typingModeButton = NSButton(title: "⌨", target: nil, action: nil)
+    let conversationModeButton = NSButton(title: "💬", target: nil, action: nil)
     let closeButton = NSButton(title: "×", target: nil, action: nil)
 
     var visibility: ChatVisibility = .open {
         didSet { applyVisibility() }
+    }
+
+    var interactionMode: InteractionMode = .typing {
+        didSet { applyMode() }
     }
 
     var tailSide: BubbleTailSide = .right {
@@ -311,19 +668,24 @@ private final class InputPanelView: NSView {
         textView.font = .monospacedSystemFont(ofSize: 15, weight: .regular)
         textView.textColor = .labelColor
 
-        [restartButton, nextButton, closeButton].forEach { button in
+        [restartButton, nextButton, closeButton, typingModeButton, conversationModeButton].forEach { button in
             button.isBordered = false
             button.font = .systemFont(ofSize: 16, weight: .bold)
             button.contentTintColor = .labelColor
         }
+        configureSymbolButton(typingModeButton, symbolName: "keyboard", fallbackTitle: "⌨", tooltip: "Typing")
+        configureSymbolButton(conversationModeButton, symbolName: "bubble.left", fallbackTitle: "💬", tooltip: "Conversation")
 
         addSubview(targetLabel)
         addSubview(statsLabel)
         addSubview(scrollView)
         addSubview(restartButton)
         addSubview(nextButton)
+        addSubview(typingModeButton)
+        addSubview(conversationModeButton)
         addSubview(closeButton)
         applyVisibility()
+        applyMode()
     }
 
     required init?(coder: NSCoder) {
@@ -440,13 +802,26 @@ private final class InputPanelView: NSView {
         let topY = bodyRect.maxY - padding - 28
 
         closeButton.frame = CGRect(x: contentMaxX - buttonSize, y: topY + 2, width: buttonSize, height: buttonSize)
-        nextButton.frame = CGRect(x: closeButton.frame.minX - buttonSize - 4, y: topY + 2, width: buttonSize, height: buttonSize)
+        conversationModeButton.frame = CGRect(
+            x: closeButton.frame.minX - buttonSize - 4,
+            y: topY + 2,
+            width: buttonSize,
+            height: buttonSize
+        )
+        typingModeButton.frame = CGRect(
+            x: conversationModeButton.frame.minX - buttonSize - 4,
+            y: topY + 2,
+            width: buttonSize,
+            height: buttonSize
+        )
+        nextButton.frame = CGRect(x: typingModeButton.frame.minX - buttonSize - 4, y: topY + 2, width: buttonSize, height: buttonSize)
         restartButton.frame = CGRect(x: nextButton.frame.minX - buttonSize - 4, y: topY + 2, width: buttonSize, height: buttonSize)
+        let controlsMinX = interactionMode == .typing ? restartButton.frame.minX : typingModeButton.frame.minX
 
         targetLabel.frame = CGRect(
             x: contentMinX,
             y: bodyRect.maxY - padding - 62,
-            width: restartButton.frame.minX - contentMinX - 8,
+            width: controlsMinX - contentMinX - 8,
             height: 58
         )
 
@@ -473,9 +848,39 @@ private final class InputPanelView: NSView {
         scrollView.isHidden = !isOpen
         restartButton.isHidden = !isOpen
         nextButton.isHidden = !isOpen
+        typingModeButton.isHidden = !isOpen
+        conversationModeButton.isHidden = !isOpen
         closeButton.isHidden = !isOpen
+        applyMode()
         needsLayout = true
         needsDisplay = true
+    }
+
+    private func applyMode() {
+        let isOpen = visibility == .open
+        restartButton.isHidden = !isOpen || interactionMode == .conversation
+        nextButton.isHidden = !isOpen || interactionMode == .conversation
+        typingModeButton.isHidden = !isOpen
+        conversationModeButton.isHidden = !isOpen
+        typingModeButton.contentTintColor = interactionMode == .typing ? .controlAccentColor : .secondaryLabelColor
+        conversationModeButton.contentTintColor = interactionMode == .conversation ? .controlAccentColor : .secondaryLabelColor
+        needsLayout = true
+    }
+
+    private func configureSymbolButton(
+        _ button: NSButton,
+        symbolName: String,
+        fallbackTitle: String,
+        tooltip: String
+    ) {
+        button.toolTip = tooltip
+        if let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: tooltip) {
+            button.title = ""
+            button.image = image
+            button.imagePosition = .imageOnly
+        } else {
+            button.title = fallbackTitle
+        }
     }
 
     private var bubbleBodyRect: CGRect {
@@ -533,12 +938,24 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
     private weak var window: NSWindow?
     private var updateTimer: Timer?
     private var petClickMonitor: Any?
+    private var localPetClickMonitor: Any?
     private var exercises = Exercise.defaults.shuffled()
     private var exerciseIndex = 0
     private var session: TypingSession
+    private var conversationSession = ConversationSession()
+    private let conversationProvider: ConversationProviding
+    private let reminderManager: ReminderManaging
+    private let codexHandoffExecutor: CodexHandoffExecuting
+    private var interactionMode: InteractionMode = .typing
     private var chatVisibility: ChatVisibility = .open
     private var lastPetToggleAt: TimeInterval = 0
     private var submittedAt: TimeInterval?
+    private var conversationTask: Task<Void, Never>?
+    private var conversationRequestID = 0
+    private var isWaitingForConversation = false
+    private var lastReminderIdentifier: String?
+    private var pendingReminderInput: String?
+    private var pendingCodexHandoff: CodexHandoffRequest?
     private var petIsAvailable = false
 
     override init() {
@@ -549,6 +966,9 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
         )
         rootView = OverlayRootView(inputPanel: inputPanel)
         session = TypingSession(exercise: exercises[0])
+        conversationProvider = makeConversationProvider()
+        reminderManager = EventKitReminderManager()
+        codexHandoffExecutor = CodexAppServerHandoffExecutor()
         super.init()
         inputPanel.textView.delegate = self
         inputPanel.textView.onEscape = { [weak self] in self?.setChatVisible(false) }
@@ -557,14 +977,23 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
         inputPanel.restartButton.action = #selector(restart)
         inputPanel.nextButton.target = self
         inputPanel.nextButton.action = #selector(nextExercise)
+        inputPanel.typingModeButton.target = self
+        inputPanel.typingModeButton.action = #selector(switchToTypingMode)
+        inputPanel.conversationModeButton.target = self
+        inputPanel.conversationModeButton.action = #selector(switchToConversationMode)
         inputPanel.closeButton.target = self
         inputPanel.closeButton.action = #selector(closeChat)
         loadExercise(index: 0)
+        applyInteractionMode()
     }
 
     deinit {
+        conversationTask?.cancel()
         if let petClickMonitor {
             NSEvent.removeMonitor(petClickMonitor)
+        }
+        if let localPetClickMonitor {
+            NSEvent.removeMonitor(localPetClickMonitor)
         }
     }
 
@@ -600,15 +1029,23 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
     }
 
     private func startPetClickMonitor() {
-        petClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.rightMouseDown]) { [weak self] _ in
-            let location = NSEvent.mouseLocation
+        let petMouseEvents: NSEvent.EventTypeMask = [.rightMouseDown, .otherMouseDown]
+        petClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: petMouseEvents) { [weak self] event in
             DispatchQueue.main.async {
-                self?.toggleChatIfPetWasSecondaryClicked(at: location)
+                self?.handlePetMouseEvent(event)
             }
+        }
+        localPetClickMonitor = NSEvent.addLocalMonitorForEvents(matching: petMouseEvents) { [weak self] event in
+            self?.handlePetMouseEvent(event)
+            return event
         }
     }
 
     func textDidChange(_ notification: Notification) {
+        guard interactionMode == .typing else {
+            return
+        }
+
         guard submittedAt == nil else {
             syncTextViewToSessionInput()
             updateStats()
@@ -626,7 +1063,9 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
     }
 
     func textViewDidChangeSelection(_ notification: Notification) {
-        guard chatVisibility == .open, !inputPanel.textView.hasMarkedText() else {
+        guard interactionMode == .typing,
+              chatVisibility == .open,
+              !inputPanel.textView.hasMarkedText() else {
             return
         }
         moveInputCaretToEnd()
@@ -644,10 +1083,18 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
         setChatVisible(false)
     }
 
+    @objc private func switchToTypingMode() {
+        setInteractionMode(.typing)
+    }
+
+    @objc private func switchToConversationMode() {
+        setInteractionMode(.conversation)
+    }
+
     private func setChatVisible(_ visible: Bool) {
         chatVisibility = visible ? .open : .closed
         inputPanel.visibility = chatVisibility
-        inputPanel.textView.isEditable = visible && submittedAt == nil
+        updateTextEditability()
         window?.ignoresMouseEvents = !visible
 
         if visible {
@@ -659,9 +1106,12 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
             window?.orderFrontRegardless()
             window?.makeKey()
             window?.makeFirstResponder(inputPanel.textView)
-            moveInputCaretToEnd()
+            if interactionMode == .typing {
+                moveInputCaretToEnd()
+            }
             NSApp.activate(ignoringOtherApps: true)
         } else {
+            cancelPendingConversation()
             window?.makeFirstResponder(nil)
             (window as? OverlayWindow)?.acceptsKeyboardFocus = false
             window?.resignKey()
@@ -669,7 +1119,73 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
         }
     }
 
-    private func toggleChatIfPetWasSecondaryClicked(at location: CGPoint) {
+    private func setInteractionMode(_ mode: InteractionMode) {
+        guard interactionMode != mode else {
+            return
+        }
+
+        if interactionMode == .conversation {
+            cancelPendingConversation()
+        }
+        interactionMode = mode
+        applyInteractionMode()
+    }
+
+    private func applyInteractionMode() {
+        inputPanel.interactionMode = interactionMode
+        inputPanel.textView.returnKeyBehavior = interactionMode == .conversation
+            ? .submitWithShiftNewline
+            : .submit
+
+        switch interactionMode {
+        case .typing:
+            inputPanel.textView.string = session.input
+            inputPanel.targetLabel.stringValue = exercises[exerciseIndex].text
+            updateStats()
+            moveInputCaretToEnd()
+        case .conversation:
+            inputPanel.textView.string = ""
+            if let reason = conversationProvider.unavailableReason {
+                inputPanel.targetLabel.stringValue = reason
+                inputPanel.statsLabel.stringValue = "Unavailable"
+            } else if let lastPetMessage = conversationSession.recentMessages.last(where: { $0.speaker == .pet }) {
+                inputPanel.targetLabel.stringValue = lastPetMessage.text
+                inputPanel.statsLabel.stringValue = "Conversation"
+            } else {
+                inputPanel.targetLabel.stringValue = "話しかけて。短く返すね。"
+                inputPanel.statsLabel.stringValue = "Conversation"
+            }
+        }
+
+        updateTextEditability()
+    }
+
+    private func updateTextEditability() {
+        guard chatVisibility == .open else {
+            inputPanel.textView.isEditable = false
+            return
+        }
+
+        switch interactionMode {
+        case .typing:
+            inputPanel.textView.isEditable = submittedAt == nil
+        case .conversation:
+            inputPanel.textView.isEditable = conversationProvider.unavailableReason == nil
+                && !isWaitingForConversation
+        }
+    }
+
+    private func handlePetMouseEvent(_ event: NSEvent) {
+        let isSecondaryClick = event.type == .rightMouseDown
+            || event.type == .otherMouseDown
+        guard isSecondaryClick else {
+            return
+        }
+
+        toggleChatIfPetWasClicked(at: NSEvent.mouseLocation)
+    }
+
+    private func toggleChatIfPetWasClicked(at location: CGPoint) {
         guard let currentPetWindow = tracker.currentPetWindow() else {
             petIsAvailable = false
             window?.orderOut(nil)
@@ -680,7 +1196,9 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
         let petVisualFrame = petRegion.visibleFrame(for: currentPetWindow, on: screen)
         petIsAvailable = true
 
-        guard petRegion.containsPetBody(location, in: petVisualFrame) else { return }
+        let clickHitsPet = petRegion.containsPetBody(location, in: petVisualFrame)
+            || currentPetWindow.frame.insetBy(dx: -24, dy: -24).contains(location)
+        guard clickHitsPet else { return }
 
         let now = CACurrentMediaTime()
         guard now - lastPetToggleAt > 0.25 else {
@@ -695,6 +1213,11 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
             return
         }
 
+        guard interactionMode == .typing else {
+            sendConversationMessage()
+            return
+        }
+
         if submittedAt != nil {
             nextExercise()
             return
@@ -706,13 +1229,323 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
         updateStats()
     }
 
+    private func sendConversationMessage() {
+        guard !isWaitingForConversation,
+              conversationProvider.unavailableReason == nil,
+              !inputPanel.textView.hasMarkedText() else {
+            return
+        }
+
+        let userMessage = inputPanel.textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !userMessage.isEmpty else {
+            return
+        }
+
+        inputPanel.textView.string = ""
+        if handlePendingCodexHandoff(userMessage) {
+            return
+        }
+
+        if handlePendingReminderClarification(userMessage) {
+            return
+        }
+
+        if ReminderParser.isUndoRequest(userMessage) {
+            removeLastReminder(userMessage: userMessage)
+            return
+        }
+
+        switch ReminderParser.parse(userMessage) {
+        case .notReminder:
+            break
+        case .needsClarification(let reply):
+            pendingReminderInput = userMessage
+            displayConversationReply(userMessage: userMessage, reply: reply)
+            return
+        case .clockAlarmUnsupported(let reply):
+            pendingReminderInput = nil
+            displayConversationReply(userMessage: userMessage, reply: reply)
+            return
+        case .ready(let reminderRequest):
+            pendingReminderInput = nil
+            createReminder(userMessage: userMessage, reminderRequest: reminderRequest)
+            return
+        }
+
+        if let codexHandoff = CodexHandoffPlanner.plan(
+            for: userMessage,
+            recentMessages: conversationSession.recentMessages
+        ) {
+            if let reason = codexHandoffExecutor.unavailableReason {
+                displayConversationReply(userMessage: userMessage, reply: reason)
+            } else {
+                pendingCodexHandoff = codexHandoff
+                displayConversationReply(
+                    userMessage: userMessage,
+                    reply: "Codexに引き継ぐ？\n\(codexHandoff.summary)"
+                )
+            }
+            return
+        }
+
+        if let unsupportedRequest = ConversationPolicy.unsupportedRequest(in: userMessage) {
+            displayConversationReply(userMessage: userMessage, reply: unsupportedRequest.reply)
+            return
+        }
+
+        let requestID = beginConversationAction(status: "Thinking")
+        let promptSession = conversationSession
+
+        conversationTask = Task { [weak self, userMessage, promptSession, requestID] in
+            guard let self else { return }
+            do {
+                let response = try await self.conversationProvider.response(
+                    to: userMessage,
+                    session: promptSession
+                )
+                await MainActor.run {
+                    self.completeConversationResponse(
+                        requestID: requestID,
+                        userMessage: userMessage,
+                        response: response
+                    )
+                }
+            } catch {
+                await MainActor.run {
+                    self.completeConversationResponse(
+                        requestID: requestID,
+                        userMessage: userMessage,
+                        response: "うまく返事できなかった。もう一度話しかけて。"
+                    )
+                }
+            }
+        }
+    }
+
+    private func handlePendingReminderClarification(_ userMessage: String) -> Bool {
+        guard let pendingInput = pendingReminderInput else {
+            return false
+        }
+
+        if ReminderParser.isCancellationReply(userMessage)
+            || ReminderParser.isUndoRequest(userMessage) {
+            pendingReminderInput = nil
+            displayConversationReply(userMessage: userMessage, reply: "リマインダーはやめておくね。")
+            return true
+        }
+
+        guard let mergedInput = ReminderParser.mergeClarification(
+            pendingInput: pendingInput,
+            reply: userMessage
+        ) else {
+            pendingReminderInput = nil
+            return false
+        }
+
+        switch ReminderParser.parse(mergedInput) {
+        case .notReminder:
+            pendingReminderInput = nil
+            return false
+        case .needsClarification(let reply):
+            pendingReminderInput = mergedInput
+            displayConversationReply(userMessage: userMessage, reply: reply)
+            return true
+        case .clockAlarmUnsupported(let reply):
+            pendingReminderInput = nil
+            displayConversationReply(userMessage: userMessage, reply: reply)
+            return true
+        case .ready(let reminderRequest):
+            pendingReminderInput = nil
+            createReminder(userMessage: userMessage, reminderRequest: reminderRequest)
+            return true
+        }
+    }
+
+    private func handlePendingCodexHandoff(_ userMessage: String) -> Bool {
+        guard let codexHandoff = pendingCodexHandoff else {
+            return false
+        }
+
+        if CodexHandoffPlanner.isConfirmation(userMessage) {
+            pendingCodexHandoff = nil
+            executeCodexHandoff(userMessage: userMessage, codexHandoff: codexHandoff)
+            return true
+        }
+
+        if CodexHandoffPlanner.isCancellation(userMessage) {
+            pendingCodexHandoff = nil
+            displayConversationReply(userMessage: userMessage, reply: "引き継ぎはやめておくね。")
+            return true
+        }
+
+        displayConversationReply(userMessage: userMessage, reply: "送るなら「はい」、やめるなら「やめて」と返してね。")
+        return true
+    }
+
+    private func createReminder(userMessage: String, reminderRequest: ReminderRequest) {
+        let requestID = beginConversationAction(status: "Reminder")
+        conversationTask = Task { [weak self, userMessage, reminderRequest, requestID] in
+            guard let self else { return }
+            do {
+                let identifier = try await self.reminderManager.createReminder(reminderRequest)
+                let reply = "リマインダーを設定したよ。\n\(self.formattedReminderDate(reminderRequest.dueDate))"
+                await MainActor.run {
+                    self.lastReminderIdentifier = identifier
+                    self.completeConversationResponse(
+                        requestID: requestID,
+                        userMessage: userMessage,
+                        response: reply
+                    )
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                await MainActor.run {
+                    self.completeConversationResponse(
+                        requestID: requestID,
+                        userMessage: userMessage,
+                        response: self.reminderFailureMessage(error)
+                    )
+                }
+            }
+        }
+    }
+
+    private func removeLastReminder(userMessage: String) {
+        guard let identifier = lastReminderIdentifier else {
+            displayConversationReply(userMessage: userMessage, reply: "取り消せるリマインダーはないよ。")
+            return
+        }
+
+        let requestID = beginConversationAction(status: "Reminder")
+        conversationTask = Task { [weak self, userMessage, identifier, requestID] in
+            guard let self else { return }
+            do {
+                try await self.reminderManager.removeReminder(identifier: identifier)
+                await MainActor.run {
+                    self.lastReminderIdentifier = nil
+                    self.completeConversationResponse(
+                        requestID: requestID,
+                        userMessage: userMessage,
+                        response: "直前のリマインダーを取り消したよ。"
+                    )
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                await MainActor.run {
+                    self.completeConversationResponse(
+                        requestID: requestID,
+                        userMessage: userMessage,
+                        response: self.reminderFailureMessage(error)
+                    )
+                }
+            }
+        }
+    }
+
+    private func executeCodexHandoff(userMessage: String, codexHandoff: CodexHandoffRequest) {
+        let requestID = beginConversationAction(status: "Codex")
+        conversationTask = Task { [weak self, userMessage, codexHandoff, requestID] in
+            guard let self else { return }
+            do {
+                let reply = try await self.codexHandoffExecutor.execute(codexHandoff)
+                await MainActor.run {
+                    self.completeConversationResponse(
+                        requestID: requestID,
+                        userMessage: userMessage,
+                        response: reply
+                    )
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                await MainActor.run {
+                    self.completeConversationResponse(
+                        requestID: requestID,
+                        userMessage: userMessage,
+                        response: "Codexに引き継げなかったよ。Codex App Serverの状態を確認してね。"
+                    )
+                }
+            }
+        }
+    }
+
+    private func displayConversationReply(userMessage: String, reply: String) {
+        conversationSession.recordUserMessage(userMessage)
+        conversationSession.recordPetMessage(reply)
+        inputPanel.targetLabel.stringValue = reply
+        inputPanel.statsLabel.stringValue = "Conversation"
+    }
+
+    private func beginConversationAction(status: String) -> Int {
+        let requestID = conversationRequestID + 1
+        conversationRequestID = requestID
+        isWaitingForConversation = true
+        inputPanel.targetLabel.stringValue = "..."
+        inputPanel.statsLabel.stringValue = status
+        updateTextEditability()
+        return requestID
+    }
+
+    private func formattedReminderDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ja_JP")
+        formatter.dateFormat = "M月d日 H:mm"
+        return formatter.string(from: date)
+    }
+
+    private func reminderFailureMessage(_ error: Error) -> String {
+        switch error as? ReminderManagerError {
+        case .accessDenied:
+            return "Remindersの権限がないみたい。macOSの設定で許可してね。"
+        case .noDefaultCalendar:
+            return "保存先のリマインダーリストが見つからなかったよ。"
+        case .reminderNotFound:
+            return "直前のリマインダーが見つからなかったよ。"
+        case nil:
+            return "リマインダーを操作できなかったよ。もう一度試してね。"
+        }
+    }
+
+    private func completeConversationResponse(requestID: Int, userMessage: String, response: String) {
+        guard interactionMode == .conversation,
+              chatVisibility == .open,
+              conversationRequestID == requestID else {
+            return
+        }
+
+        let normalized = ConversationResponseNormalizer.normalize(
+            response,
+            maxSentences: conversationSession.persona.maxResponseSentences
+        )
+        conversationSession.recordUserMessage(userMessage)
+        conversationSession.recordPetMessage(normalized)
+        isWaitingForConversation = false
+        conversationTask = nil
+        inputPanel.targetLabel.stringValue = normalized
+        inputPanel.statsLabel.stringValue = "Conversation"
+        updateTextEditability()
+        window?.makeFirstResponder(inputPanel.textView)
+    }
+
+    private func cancelPendingConversation() {
+        conversationTask?.cancel()
+        conversationTask = nil
+        conversationRequestID += 1
+        isWaitingForConversation = false
+        pendingReminderInput = nil
+        pendingCodexHandoff = nil
+        updateTextEditability()
+    }
+
     private func loadExercise(index: Int) {
         exerciseIndex = max(0, min(index, exercises.count - 1))
         submittedAt = nil
         session = TypingSession(exercise: exercises[exerciseIndex])
         inputPanel.targetLabel.stringValue = exercises[exerciseIndex].text
         inputPanel.textView.string = ""
-        inputPanel.textView.isEditable = true
+        updateTextEditability()
         moveInputCaretToEnd()
         updateStats()
     }
@@ -740,6 +1573,10 @@ private final class OverlayController: NSObject, NSTextViewDelegate {
     }
 
     private func updateStats() {
+        guard interactionMode == .typing else {
+            return
+        }
+
         let metrics = session.metrics(at: session.completedAt ?? submittedAt ?? Date().timeIntervalSince1970)
         let score = typingScore(for: metrics)
         let progress = Int((metrics.progress * 100).rounded())
@@ -855,11 +1692,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         self.controller = controller
         self.window = window
 
+        ProcessInfo.processInfo.disableAutomaticTermination(
+            "Typing With My Pets needs to keep monitoring Pet clicks while the panel is hidden."
+        )
+        ProcessInfo.processInfo.disableSuddenTermination()
         NSApp.activate(ignoringOtherApps: true)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
     }
 }
 
